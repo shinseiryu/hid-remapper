@@ -113,6 +113,56 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 static bool scanning = false;
 static bool peers_only = true;
 
+// Event log that the config tool reads to show what's going on with Bluetooth.
+#define BT_EVENT_LOG_SIZE 32
+static struct bt_event_t bt_event_log[BT_EVENT_LOG_SIZE];
+static uint32_t bt_event_next_seq = 1;
+static K_MUTEX_DEFINE(bt_event_mutex);
+
+static void log_bt_event(BtEvent type, const bt_addr_le_t* addr, int32_t value) {
+    k_mutex_lock(&bt_event_mutex, K_FOREVER);
+    struct bt_event_t* event = &bt_event_log[bt_event_next_seq % BT_EVENT_LOG_SIZE];
+    memset(event, 0, sizeof(*event));
+    event->seq = bt_event_next_seq++;
+    event->time_ms = (uint32_t) k_uptime_get();
+    event->type = type;
+    if (addr != NULL) {
+        event->addr_type = addr->type;
+        memcpy(event->addr, addr->a.val, sizeof(event->addr));
+    }
+    event->value = value;
+    k_mutex_unlock(&bt_event_mutex);
+}
+
+bool get_bt_event(uint32_t seq, bt_event_t* event) {
+    bool found = false;
+    k_mutex_lock(&bt_event_mutex, K_FOREVER);
+    uint32_t oldest = (bt_event_next_seq > BT_EVENT_LOG_SIZE) ? bt_event_next_seq - BT_EVENT_LOG_SIZE : 1;
+    if (seq < oldest) {
+        seq = oldest;
+    }
+    if (seq < bt_event_next_seq) {
+        *event = bt_event_log[seq % BT_EVENT_LOG_SIZE];
+        found = true;
+    }
+    k_mutex_unlock(&bt_event_mutex);
+    return found;
+}
+
+// "Web scan" mode, started from the config tool: scan actively, don't filter, don't
+// connect automatically, collect results for the config tool to show, connect when
+// the config tool says so. Ends when the config tool stops it or stops polling.
+static const int WEB_SCAN_TIMEOUT_MS = 15000;
+#define SCAN_RESULTS_MAX 32
+static atomic_t web_scan_requested = ATOMIC_INIT(0);  // what the config tool wants
+static bool web_scan_active = false;                  // what we're doing (system workqueue only)
+static bool web_connecting = false;                   // system workqueue and BT callbacks
+static bool web_scan_timed_out = false;
+static struct scan_result_t scan_results[SCAN_RESULTS_MAX];
+static K_MUTEX_DEFINE(scan_results_mutex);
+static bt_addr_le_t web_connect_addr;
+
+
 static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(6, 6, 44, 400);
 
 static void activity_led_off_work_fn(struct k_work* work) {
@@ -243,6 +293,23 @@ static bool scan_setup_filters() {
 static void scan_start_work_fn(struct k_work* work) {
     if (scanning) {
         scan_stop();
+    }
+    if (web_scan_active) {
+        if (web_connecting) {
+            // will be rescheduled when the connection attempt finishes
+            return;
+        }
+        // Make sure the scan library never connects on its own. Just disabling the filters
+        // isn't enough: if they were last enabled in "match all" mode, the library treats
+        // "0 out of 0 filters matched" as a match and connects to everything.
+        bt_scan_filter_remove_all();
+        CHK(bt_scan_filter_enable(BT_SCAN_UUID_FILTER, false));
+        bt_scan_filter_disable();
+        if (CHK(bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE))) {
+            scanning = true;
+            set_led_mode(LedMode::ON);
+        }
+        return;
     }
     if (scan_setup_filters()) {
         scan_start();
@@ -489,6 +556,7 @@ static void clear_bonds_work_fn(struct k_work* work) {
         return;
     }
     forget_device_name(&BT_ADDR_LE_ANY_);
+    log_bt_event(BtEvent::ALL_FORGOTTEN, NULL, 0);
 
     scan_stop();
     bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
@@ -507,6 +575,7 @@ static void forget_device_work_fn(struct k_work* work) {
         LOG_INF("Forgot %s.", addr_str);
     }
     forget_device_name(&addr_to_forget);
+    log_bt_event(BtEvent::FORGOTTEN, &addr_to_forget, 0);
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
 static K_WORK_DEFINE(forget_device_work, forget_device_work_fn);
@@ -536,6 +605,10 @@ static void scan_connecting(struct bt_scan_device_info* device_info, struct bt_c
 static void scan_filter_no_match(struct bt_scan_device_info* device_info, bool connectable) {
     struct bt_conn* conn;
     char addr[BT_ADDR_LE_STR_LEN];
+
+    if (web_scan_active) {
+        return;
+    }
 
     if (device_info->recv_info->adv_type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
         bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
@@ -590,13 +663,19 @@ static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
 
+static void web_connect_done();
+
 static void discovery_service_not_found_cb(struct bt_conn* conn, void* context) {
     LOG_WRN("");
+    log_bt_event(BtEvent::HID_SETUP_FAILED, bt_conn_get_dst(conn), -1);
+    web_connect_done();
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
 
 static void discovery_error_found_cb(struct bt_conn* conn, int err, void* context) {
     LOG_ERR("err=%d", err);
+    log_bt_event(BtEvent::HID_SETUP_FAILED, bt_conn_get_dst(conn), err);
+    web_connect_done();
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
 
@@ -639,12 +718,15 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
 
     if (conn_err) {
         LOG_ERR("Failed to connect to %s (conn_err=%u).", addr, conn_err);
+        log_bt_event(BtEvent::CONNECT_FAILED, bt_conn_get_dst(conn), conn_err);
+        web_connect_done();
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 
         return;
     }
 
     LOG_INF("%s", addr);
+    log_bt_event(BtEvent::CONNECTED, bt_conn_get_dst(conn), 0);
 
     CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
 }
@@ -655,6 +737,8 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     LOG_INF("%s (reason=%u)", addr, reason);
+    log_bt_event(BtEvent::DISCONNECTED, bt_conn_get_dst(conn), reason);
+    web_connect_done();
 
     uint8_t conn_idx = bt_conn_index(conn);
 
@@ -677,10 +761,13 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
 
     if (!err) {
         LOG_INF("%s, level=%u.", addr, level);
+        log_bt_event(BtEvent::SECURITY_CHANGED, bt_conn_get_dst(conn), level);
         peers_only = true;
         gatt_discover(conn);
     } else {
         LOG_ERR("security failed: %s, level=%u, err=%d", addr, level, err);
+        log_bt_event(BtEvent::SECURITY_FAILED, bt_conn_get_dst(conn), err);
+        web_connect_done();
     }
 }
 
@@ -702,6 +789,271 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .security_changed = security_changed,
 };
 
+static void auth_cancel(struct bt_conn* conn) {
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_WRN("%s", addr);
+    log_bt_event(BtEvent::PAIRING_CANCELLED, bt_conn_get_dst(conn), 0);
+}
+
+static void pairing_complete(struct bt_conn* conn, bool bonded) {
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_INF("%s, bonded=%d", addr, bonded);
+    log_bt_event(BtEvent::PAIRING_COMPLETE, bt_conn_get_dst(conn), bonded);
+}
+
+static void pairing_failed(struct bt_conn* conn, enum bt_security_err reason) {
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_ERR("%s, reason %d", addr, reason);
+    log_bt_event(BtEvent::PAIRING_FAILED, bt_conn_get_dst(conn), reason);
+}
+
+static void auth_passkey_display(struct bt_conn* conn, unsigned int passkey) {
+    LOG_INF("passkey %06u", passkey);
+    log_bt_event(BtEvent::PASSKEY_DISPLAY, bt_conn_get_dst(conn), passkey);
+}
+
+// No way to show a passkey, so pairing is "Just Works" only. Used normally.
+static struct bt_conn_auth_cb conn_auth_callbacks = {
+    .cancel = auth_cancel,
+};
+
+// Used in web scan mode: the config tool shows the passkey so that it can be typed
+// on a keyboard that asks for one.
+static struct bt_conn_auth_cb web_conn_auth_callbacks = {
+    .passkey_display = auth_passkey_display,
+    .cancel = auth_cancel,
+};
+
+struct web_scan_parse_ctx {
+    struct scan_result_t* result;
+    bool is_scan_rsp;
+};
+
+static bool web_scan_parse_cb(struct bt_data* data, void* user_data) {
+    struct web_scan_parse_ctx* ctx = (struct web_scan_parse_ctx*) user_data;
+    struct scan_result_t* result = ctx->result;
+    switch (data->type) {
+        case BT_DATA_NAME_COMPLETE:
+        case BT_DATA_NAME_SHORTENED: {
+            // prefer the complete name over a shortened one
+            if ((data->type == BT_DATA_NAME_SHORTENED) && (result->name[0] != '\0')) {
+                break;
+            }
+            uint8_t len = MIN(data->data_len, sizeof(result->name));
+            memset(result->name, 0, sizeof(result->name));
+            memcpy(result->name, data->data, len);
+            break;
+        }
+        case BT_DATA_UUID16_SOME:
+        case BT_DATA_UUID16_ALL:
+            for (int i = 0; i + 1 < data->data_len; i += 2) {
+                if (sys_get_le16(&data->data[i]) == BT_UUID_HIDS_VAL) {
+                    result->flags |= ctx->is_scan_rsp ? SCAN_RESULT_FLAG_HID_IN_SCAN_RSP : SCAN_RESULT_FLAG_HID_IN_ADV;
+                }
+            }
+            break;
+        case BT_DATA_GAP_APPEARANCE:
+            if (data->data_len >= 2) {
+                result->appearance = sys_get_le16(data->data);
+            }
+            break;
+    }
+    return true;
+}
+
+// How much we want to keep a scan result when the table is full.
+static int scan_result_score(const struct scan_result_t* result) {
+    bool hid = (result->flags & (SCAN_RESULT_FLAG_HID_IN_ADV | SCAN_RESULT_FLAG_HID_IN_SCAN_RSP)) ||
+               ((result->appearance >> 6) == 0x0F);  // appearance category "Human Interface Device"
+    return (hid ? 1000 : 0) + ((result->name[0] != '\0') ? 200 : 0) +
+           ((result->flags & SCAN_RESULT_FLAG_CONNECTABLE) ? 100 : 0) + result->rssi;
+}
+
+static void web_scan_recv(const struct bt_le_scan_recv_info* info, struct net_buf_simple* ad) {
+    if (!web_scan_active) {
+        return;
+    }
+
+    bool is_scan_rsp = (info->adv_props & BT_GAP_ADV_PROP_SCAN_RESPONSE) != 0;
+
+    struct scan_result_t incoming;
+    memset(&incoming, 0, sizeof(incoming));
+    incoming.valid = 1;
+    incoming.addr_type = info->addr->type;
+    memcpy(incoming.addr, info->addr->a.val, sizeof(incoming.addr));
+    incoming.rssi = info->rssi;
+    if (is_scan_rsp) {
+        incoming.flags |= SCAN_RESULT_FLAG_GOT_SCAN_RSP;
+    } else if (info->adv_props & BT_GAP_ADV_PROP_CONNECTABLE) {
+        incoming.flags |= SCAN_RESULT_FLAG_CONNECTABLE;
+    }
+    struct web_scan_parse_ctx ctx = { .result = &incoming, .is_scan_rsp = is_scan_rsp };
+    struct net_buf_simple_state state;
+    net_buf_simple_save(ad, &state);
+    bt_data_parse(ad, web_scan_parse_cb, &ctx);
+    net_buf_simple_restore(ad, &state);
+
+    k_mutex_lock(&scan_results_mutex, K_FOREVER);
+    struct scan_result_t* existing = NULL;
+    struct scan_result_t* free_slot = NULL;
+    struct scan_result_t* worst = NULL;
+    for (int i = 0; i < SCAN_RESULTS_MAX; i++) {
+        struct scan_result_t* r = &scan_results[i];
+        if (!r->valid) {
+            if (free_slot == NULL) {
+                free_slot = r;
+            }
+            continue;
+        }
+        if ((r->addr_type == incoming.addr_type) && !memcmp(r->addr, incoming.addr, sizeof(r->addr))) {
+            existing = r;
+            break;
+        }
+        if ((worst == NULL) || (scan_result_score(r) < scan_result_score(worst))) {
+            worst = r;
+        }
+    }
+    if (existing != NULL) {
+        // advertising packets and scan responses carry different things, so merge them
+        existing->rssi = incoming.rssi;
+        existing->flags |= incoming.flags;
+        if (incoming.name[0] != '\0') {
+            memcpy(existing->name, incoming.name, sizeof(existing->name));
+        }
+        if (incoming.appearance != 0) {
+            existing->appearance = incoming.appearance;
+        }
+    } else if (free_slot != NULL) {
+        *free_slot = incoming;
+    } else if ((worst != NULL) && (scan_result_score(&incoming) > scan_result_score(worst))) {
+        // table full: replace the least interesting device
+        *worst = incoming;
+    }
+    k_mutex_unlock(&scan_results_mutex);
+}
+
+static struct bt_le_scan_cb web_scan_listener = {
+    .recv = web_scan_recv,
+};
+
+// Called from BT callbacks when a connection attempt started from the config tool
+// has finished, one way or another.
+static void web_connect_done() {
+    if (web_connecting) {
+        web_connecting = false;
+        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    }
+}
+
+static void web_scan_timeout_work_fn(struct k_work* work);
+static K_WORK_DELAYABLE_DEFINE(web_scan_timeout_work, web_scan_timeout_work_fn);
+
+// Applies web_scan_requested. Runs on the system workqueue, like the scan start work.
+static void web_scan_update_work_fn(struct k_work* work) {
+    bool requested = atomic_get(&web_scan_requested);
+    if (requested == web_scan_active) {
+        return;
+    }
+    if (requested) {
+        k_mutex_lock(&scan_results_mutex, K_FOREVER);
+        memset(scan_results, 0, sizeof(scan_results));
+        k_mutex_unlock(&scan_results_mutex);
+        CHK(bt_conn_auth_cb_register(NULL));
+        CHK(bt_conn_auth_cb_register(&web_conn_auth_callbacks));
+        web_scan_active = true;
+        web_scan_timed_out = false;
+        log_bt_event(BtEvent::WEB_SCAN_STARTED, NULL, 0);
+    } else {
+        web_scan_active = false;
+        web_connecting = false;
+        CHK(bt_conn_auth_cb_register(NULL));
+        CHK(bt_conn_auth_cb_register(&conn_auth_callbacks));
+        if (scanning) {
+            scan_stop();
+        }
+        log_bt_event(BtEvent::WEB_SCAN_ENDED, NULL, web_scan_timed_out);
+    }
+    k_work_reschedule(&scan_start_work, K_NO_WAIT);
+}
+static K_WORK_DEFINE(web_scan_update_work, web_scan_update_work_fn);
+
+static void web_scan_timeout_work_fn(struct k_work* work) {
+    if (atomic_get(&web_scan_requested)) {
+        LOG_INF("config tool stopped polling, ending web scan");
+        web_scan_timed_out = true;
+        atomic_set(&web_scan_requested, 0);
+        k_work_submit(&web_scan_update_work);
+    }
+}
+
+void set_web_scan(bool enabled) {
+    atomic_set(&web_scan_requested, enabled);
+    if (enabled) {
+        k_work_reschedule(&web_scan_timeout_work, K_MSEC(WEB_SCAN_TIMEOUT_MS));
+    } else {
+        k_work_cancel_delayable(&web_scan_timeout_work);
+    }
+    k_work_submit(&web_scan_update_work);
+}
+
+static bool is_connected(const bt_addr_le_t* addr);
+
+bool get_scan_result(uint32_t index, scan_result_t* result) {
+    if (index >= SCAN_RESULTS_MAX) {
+        return false;
+    }
+    k_mutex_lock(&scan_results_mutex, K_FOREVER);
+    // slots are only ever filled or replaced, and only cleared all at once, so the valid ones are contiguous
+    *result = scan_results[index];
+    k_mutex_unlock(&scan_results_mutex);
+    if (!result->valid) {
+        return false;
+    }
+
+    bt_addr_le_t addr;
+    addr.type = result->addr_type;
+    memcpy(addr.a.val, result->addr, sizeof(addr.a.val));
+    if (bond_exists(&addr)) {
+        result->flags |= SCAN_RESULT_FLAG_PAIRED;
+    }
+    if (is_connected(&addr)) {
+        result->flags |= SCAN_RESULT_FLAG_CONNECTED;
+    }
+    return true;
+}
+
+static void web_connect_work_fn(struct k_work* work) {
+    if (!web_scan_active || web_connecting) {
+        return;
+    }
+    if (scanning) {
+        scan_stop();
+    }
+    web_connecting = true;
+    log_bt_event(BtEvent::CONNECTING, &web_connect_addr, 0);
+
+    struct bt_conn* conn;
+    int err = bt_conn_le_create(&web_connect_addr, &BT_CONN_LE_CREATE_CONN_, conn_param, &conn);
+    if (err) {
+        LOG_ERR("bt_conn_le_create returned %d", err);
+        log_bt_event(BtEvent::CONNECT_FAILED, &web_connect_addr, err);
+        web_connect_done();
+        return;
+    }
+    // the connected() callback takes it from here
+    bt_conn_unref(conn);
+}
+static K_WORK_DEFINE(web_connect_work, web_connect_work_fn);
+
+void connect_device(uint8_t addr_type, const uint8_t* addr) {
+    web_connect_addr.type = addr_type;
+    memcpy(web_connect_addr.a.val, addr, sizeof(web_connect_addr.a.val));
+    k_work_submit(&web_connect_work);
+}
+
 static void scan_init() {
     struct bt_scan_init_param scan_init = {
         .scan_param = NULL,
@@ -711,6 +1063,7 @@ static void scan_init() {
 
     bt_scan_init(&scan_init);
     bt_scan_cb_register(&scan_cb);
+    bt_le_scan_cb_register(&web_scan_listener);
 }
 
 static int8_t hogp_index(struct bt_hogp* hogp) {
@@ -806,6 +1159,9 @@ static void hogp_ready_work_fn(struct k_work* work) {
         }
 
         bt_hogp_map_read(item.hogp, hogp_map_read_cb, 0, K_NO_WAIT);
+
+        log_bt_event(BtEvent::READY, bt_conn_get_dst(bt_hogp_conn(item.hogp)), 0);
+        web_connect_done();
     }
 }
 static K_WORK_DEFINE(hogp_ready_work, hogp_ready_work_fn);
@@ -818,6 +1174,8 @@ static void hogp_ready_cb(struct bt_hogp* hogp) {
 
 static void hogp_prep_error_cb(struct bt_hogp* hogp, int err) {
     LOG_ERR("err=%d", err);
+    log_bt_event(BtEvent::HID_SETUP_FAILED, bt_conn_get_dst(bt_hogp_conn(hogp)), err);
+    web_connect_done();
 }
 
 static const struct bt_hogp_init_params hogp_init_params = {
@@ -825,27 +1183,6 @@ static const struct bt_hogp_init_params hogp_init_params = {
     .prep_error_cb = hogp_prep_error_cb,
 };
 
-static void auth_cancel(struct bt_conn* conn) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    LOG_WRN("%s", addr);
-}
-
-static void pairing_complete(struct bt_conn* conn, bool bonded) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    LOG_INF("%s, bonded=%d", addr, bonded);
-}
-
-static void pairing_failed(struct bt_conn* conn, enum bt_security_err reason) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    LOG_ERR("%s, reason %d", addr, reason);
-}
-
-static struct bt_conn_auth_cb conn_auth_callbacks = {
-    .cancel = auth_cancel,
-};
 
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
     .pairing_complete = pairing_complete,
@@ -1134,6 +1471,12 @@ static void is_connected_cb(struct bt_conn* conn, void* data) {
     }
 }
 
+static bool is_connected(const bt_addr_le_t* addr) {
+    struct is_connected_ctx ctx = { .addr = addr, .connected = false };
+    bt_conn_foreach(BT_CONN_TYPE_LE, is_connected_cb, &ctx);
+    return ctx.connected;
+}
+
 bool get_paired_device(uint32_t index, paired_device_t* device) {
     struct bond_at_index_ctx bond_ctx = { .index = index, .i = 0, .found = false };
     bt_foreach_bond(BT_ID_DEFAULT, bond_at_index_cb, &bond_ctx);
@@ -1141,12 +1484,9 @@ bool get_paired_device(uint32_t index, paired_device_t* device) {
         return false;
     }
 
-    // same notion of "connected" as the LED blink count
-    struct is_connected_ctx conn_ctx = { .addr = &bond_ctx.addr, .connected = false };
-    bt_conn_foreach(BT_CONN_TYPE_LE, is_connected_cb, &conn_ctx);
-
     device->valid = 1;
-    device->connected = conn_ctx.connected;
+    // same notion of "connected" as the LED blink count
+    device->connected = is_connected(&bond_ctx.addr);
     device->addr_type = bond_ctx.addr.type;
     memcpy(device->addr, bond_ctx.addr.a.val, sizeof(device->addr));
 

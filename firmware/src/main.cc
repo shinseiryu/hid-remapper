@@ -216,6 +216,20 @@ bool get_paired_device(uint32_t index, paired_device_t* device) {
 void forget_device(uint8_t addr_type, const uint8_t* addr) {
 }
 
+void set_web_scan(bool enabled) {
+}
+
+bool get_scan_result(uint32_t index, scan_result_t* result) {
+    return false;
+}
+
+void connect_device(uint8_t addr_type, const uint8_t* addr) {
+}
+
+bool get_bt_event(uint32_t seq, bt_event_t* event) {
+    return false;
+}
+
 void my_mutexes_init() {
     for (int i = 0; i < (int8_t) MutexId::N; i++) {
         mutex_init(&mutexes[i]);

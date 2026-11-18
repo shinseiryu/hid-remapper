@@ -26,7 +26,6 @@ const GPIO_OUTPUT_MODE_FLAG = 1 << 5;
 const NORMALIZE_GAMEPAD_INPUTS_FLAG = 1 << 6;
 const HUB_PORT_NONE = 255;
 const MAX_PAIRED_DEVICES = 32;
-const PAIRED_DEVICES_REFRESH_INTERVAL_MS = 3000;
 
 const QUIRK_FLAG_RELATIVE_MASK = 0b10000000;
 const QUIRK_FLAG_SIGNED_MASK = 0b01000000;
@@ -64,6 +63,67 @@ const ADD_QUIRK = 24;
 const GET_QUIRK = 25;
 const GET_PAIRED_DEVICE = 26;
 const FORGET_DEVICE = 27;
+const SET_WEB_SCAN = 28;
+const GET_SCAN_RESULT = 29;
+const CONNECT_DEVICE = 30;
+const GET_BT_EVENT = 31;
+
+const SCAN_RESULTS_MAX = 32;
+const SCAN_RESULT_FLAG_CONNECTABLE = 1 << 0;
+const SCAN_RESULT_FLAG_HID_IN_ADV = 1 << 1;
+const SCAN_RESULT_FLAG_HID_IN_SCAN_RSP = 1 << 2;
+const SCAN_RESULT_FLAG_PAIRED = 1 << 3;
+const SCAN_RESULT_FLAG_CONNECTED = 1 << 4;
+const SCAN_RESULT_FLAG_GOT_SCAN_RSP = 1 << 5;
+
+const BT_EVENT = {
+    WEB_SCAN_STARTED: 1,
+    WEB_SCAN_ENDED: 2,
+    CONNECTING: 3,
+    CONNECT_FAILED: 4,
+    CONNECTED: 5,
+    SECURITY_CHANGED: 6,
+    SECURITY_FAILED: 7,
+    PASSKEY_DISPLAY: 8,
+    PAIRING_CANCELLED: 9,
+    PAIRING_COMPLETE: 10,
+    PAIRING_FAILED: 11,
+    HID_SETUP_FAILED: 12,
+    READY: 13,
+    DISCONNECTED: 14,
+    FORGOTTEN: 15,
+    ALL_FORGOTTEN: 16,
+};
+
+// Bluetooth spec HCI error codes, the ones likely to show up here
+const HCI_REASONS = {
+    0x02: "the device didn't answer (is it still in pairing mode, and in range?)",
+    0x05: "authentication failed",
+    0x06: "key missing (the device may have forgotten the pairing; forget it here and pair again)",
+    0x08: "connection timed out (out of range or switched off?)",
+    0x13: "the device ended the connection",
+    0x14: "the device ended the connection (low resources)",
+    0x15: "the device is powering off",
+    0x16: "the remapper ended the connection",
+    0x1A: "the device doesn't support a required feature",
+    0x22: "the device stopped responding",
+    0x3B: "the device rejected the connection parameters",
+    0x3D: "encryption error",
+    0x3E: "the connection couldn't be established",
+};
+
+const SECURITY_ERRORS = [
+    "no error",
+    "authentication failed (wrong passkey, or the passkey wasn't entered in time)",
+    "PIN or key missing (the device may have forgotten the pairing; forget it here and pair again)",
+    "OOB data not available",
+    "the device's security requirements can't be met",
+    "pairing not supported",
+    "pairing not allowed (is the device in pairing mode?)",
+    "invalid parameters",
+    "key rejected",
+    "unspecified error",
+];
 
 const PERSIST_CONFIG_SUCCESS = 1;
 const PERSIST_CONFIG_CONFIG_TOO_BIG = 2;
@@ -180,6 +240,20 @@ let save_to_device_checkmark_timeout_id = null;
 let busy = false;
 let paired_devices_supported = true;
 let paired_devices_timer = null;
+let bt_events_supported = true;
+let bt_scanning = false;
+// set once the firmware confirms the scan we asked for started, so that older
+// "stopped scanning" events in the log don't turn our scan off
+let bt_scan_confirmed = false;
+// the first read gets the firmware's past events; we show them but don't act on them
+let bt_history_loaded = false;
+let bt_tick_count = 0;
+let bt_next_event_seq = 0;
+let bt_scan_results = [];
+let bt_paired_devices = [];
+let bt_known_names = {};
+let bt_connect_pending = null;  // address string while a connection attempt is in progress
+let bt_connect_pending_since = 0;
 const ignored_usages = new Set([
 ]);
 let modal_return_mapping = null;
@@ -196,6 +270,8 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("flash_b_side").addEventListener("click", flash_b_side);
     document.getElementById("pair_new_device").addEventListener("click", pair_new_device);
     document.getElementById("clear_bonds").addEventListener("click", clear_bonds);
+    document.getElementById("bt_scan_toggle").addEventListener("click", bt_scan_toggle);
+    document.getElementById("bt_scan_hid_only").addEventListener("change", render_scan_results);
     document.getElementById("monitor_clear").addEventListener("click", monitor_clear);
     document.getElementById("file_input").addEventListener("change", file_uploaded);
     document.getElementById("add_quirk").addEventListener("click", add_empty_quirk);
@@ -268,6 +344,11 @@ async function open_device() {
                 setup_usages_modals();
                 bluetooth_buttons_set_visibility(device.productName.includes("Bluetooth"));
                 paired_devices_supported = true;
+                bt_events_supported = true;
+                bt_scanning = false;
+                bt_next_event_seq = 0;
+                bt_history_loaded = false;
+                document.getElementById("bt_event_log").replaceChildren();
             }
         }
     } catch (e) {
@@ -901,16 +982,21 @@ function is_bluetooth_device() {
 }
 
 function actions_tab_shown() {
-    refresh_paired_devices();
+    bt_tick();
     if (paired_devices_timer == null) {
-        paired_devices_timer = setInterval(refresh_paired_devices, PAIRED_DEVICES_REFRESH_INTERVAL_MS);
+        paired_devices_timer = setInterval(bt_tick, 1000);
     }
 }
 
-function actions_tab_hide() {
+async function actions_tab_hide() {
     if (paired_devices_timer != null) {
         clearInterval(paired_devices_timer);
         paired_devices_timer = null;
+    }
+    if (bt_scanning) {
+        bt_scanning = false;
+        await with_device_lock(() => send_feature_command(SET_WEB_SCAN, [[UINT8, 0]]));
+        update_scan_button();
     }
 }
 
@@ -919,48 +1005,159 @@ function format_bt_address(addr_bytes) {
     return addr_bytes.slice().reverse().map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
 }
 
+function bytes_to_string(bytes) {
+    let s = '';
+    for (const b of bytes) {
+        if (b == 0) {
+            break;
+        }
+        s += String.fromCharCode(b);
+    }
+    // names are UTF-8
+    try {
+        s = decodeURIComponent(escape(s));
+    } catch (e) {
+    }
+    return s;
+}
+
+async function read_packet(command, index) {
+    await send_feature_command(command, [[UINT32, index]]);
+    return await read_config_feature(new Array(CONFIG_SIZE - 4).fill(UINT8));
+}
+
+function int32_from_bytes(bytes) {
+    return new DataView(new Uint8Array(bytes).buffer).getInt32(0, true);
+}
+
+function uint32_from_bytes(bytes) {
+    return new DataView(new Uint8Array(bytes).buffer).getUint32(0, true);
+}
+
 async function read_paired_devices() {
     let devices = [];
     for (let i = 0; i < MAX_PAIRED_DEVICES; i++) {
-        await send_feature_command(GET_PAIRED_DEVICE, [[UINT32, i]]);
-        const bytes = await read_config_feature(new Array(CONFIG_SIZE - 4).fill(UINT8));
+        const bytes = await read_packet(GET_PAIRED_DEVICE, i);
         const [valid, connected, addr_type] = bytes;
         if (!valid) {
             break;
         }
-        const addr = bytes.slice(3, 9);
-        let name = '';
-        for (const b of bytes.slice(9)) {
-            if (b == 0) {
-                break;
-            }
-            name += String.fromCharCode(b);
-        }
-        // names are UTF-8
-        try {
-            name = decodeURIComponent(escape(name));
-        } catch (e) {
-        }
-        devices.push({ connected: !!connected, addr_type: addr_type, addr: addr, name: name });
+        devices.push({ connected: !!connected, addr_type: addr_type, addr: bytes.slice(3, 9), name: bytes_to_string(bytes.slice(9)) });
     }
     return devices;
 }
 
-async function refresh_paired_devices() {
-    if (!is_bluetooth_device() || !paired_devices_supported || busy) {
+async function read_scan_results() {
+    let results = [];
+    for (let i = 0; i < SCAN_RESULTS_MAX; i++) {
+        const bytes = await read_packet(GET_SCAN_RESULT, i);
+        if (!bytes[0]) {
+            break;
+        }
+        results.push({
+            addr_type: bytes[1],
+            addr: bytes.slice(2, 8),
+            rssi: (bytes[8] << 24) >> 24,
+            flags: bytes[9],
+            appearance: bytes[10] | (bytes[11] << 8),
+            name: bytes_to_string(bytes.slice(12)),
+        });
+    }
+    return results;
+}
+
+async function read_new_events() {
+    let events = [];
+    for (let i = 0; i < 32; i++) {
+        const bytes = await read_packet(GET_BT_EVENT, bt_next_event_seq);
+        const seq = uint32_from_bytes(bytes.slice(0, 4));
+        if (seq == 0) {
+            break;
+        }
+        events.push({
+            seq: seq,
+            time_ms: uint32_from_bytes(bytes.slice(4, 8)),
+            type: bytes[8],
+            addr_type: bytes[9],
+            addr: bytes.slice(10, 16),
+            value: int32_from_bytes(bytes.slice(16, 20)),
+        });
+        bt_next_event_seq = seq + 1;
+    }
+    return events;
+}
+
+// Called every second while the Actions tab is open.
+async function bt_tick() {
+    if (!is_bluetooth_device() || busy) {
         return;
     }
     busy = true;
-    let devices = null;
+    bt_tick_count++;
+    let events = [];
+    let paired_changed = false;
+    let scan_changed = false;
+    let history_read_ok = false;
     try {
-        devices = await read_paired_devices();
-    } catch (e) {
-        // firmware from before this feature doesn't answer GET_PAIRED_DEVICE
-        paired_devices_supported = false;
+        if (bt_events_supported) {
+            try {
+                if (bt_scanning) {
+                    // also keeps the scan going; the firmware stops it if we stop asking
+                    await send_feature_command(SET_WEB_SCAN, [[UINT8, 1]]);
+                    bt_scan_results = await read_scan_results();
+                    scan_changed = true;
+                }
+                events = await read_new_events();
+                history_read_ok = true;
+            } catch (e) {
+                // firmware from before this feature doesn't answer these
+                bt_events_supported = false;
+                bt_scanning = false;
+            }
+        }
+        if (paired_devices_supported && ((bt_tick_count % 3 == 1) || (events.length > 0))) {
+            try {
+                bt_paired_devices = await read_paired_devices();
+                paired_changed = true;
+            } catch (e) {
+                paired_devices_supported = false;
+                paired_changed = true;
+            }
+        }
     } finally {
         busy = false;
     }
-    render_paired_devices(devices);
+
+    for (const d of bt_scan_results.concat(bt_paired_devices)) {
+        if (d.name) {
+            bt_known_names[format_bt_address(d.addr)] = d.name;
+        }
+    }
+    const live = bt_history_loaded;
+    if (bt_events_supported && history_read_ok) {
+        bt_history_loaded = true;
+    }
+    if (!live && events.length > 0) {
+        add_log_line("(earlier activity; times are seconds since the remapper started)", "secondary");
+    }
+    for (const e of events) {
+        handle_bt_event(e, live);
+    }
+    if ((bt_connect_pending != null) && (Date.now() - bt_connect_pending_since > 60000)) {
+        bt_connect_pending = null;
+    }
+    if (paired_changed) {
+        render_paired_devices(paired_devices_supported ? bt_paired_devices : null);
+    }
+    if (scan_changed || events.length > 0) {
+        render_scan_results();
+    }
+    render_scan_section();
+}
+
+async function refresh_paired_devices() {
+    bt_tick_count = 0;  // makes the next tick read the paired devices
+    await bt_tick();
 }
 
 function render_paired_devices(devices) {
@@ -975,7 +1172,7 @@ function render_paired_devices(devices) {
         return;
     }
     if (devices.length == 0) {
-        status.innerText = "No paired devices. Put a device in pairing mode, then click \"Pair new device\".";
+        status.innerText = "No paired devices.";
         return;
     }
     status.innerText = "Updates every few seconds while this tab is open.";
@@ -1002,6 +1199,218 @@ async function forget_device(d) {
     await with_device_lock(() => send_feature_command(FORGET_DEVICE, [[UINT8, d.addr_type], ...d.addr.map(b => [UINT8, b])]));
     // the firmware does the unpairing asynchronously
     setTimeout(refresh_paired_devices, 1500);
+}
+
+function update_scan_button() {
+    const button = document.getElementById("bt_scan_toggle");
+    button.textContent = bt_scanning ? "Stop scanning" : "Scan for devices";
+    button.classList.toggle("btn-primary", !bt_scanning);
+    button.classList.toggle("btn-outline-secondary", bt_scanning);
+}
+
+async function bt_scan_toggle() {
+    bt_scanning = !bt_scanning;
+    bt_scan_confirmed = false;
+    if (bt_scanning) {
+        bt_scan_results = [];
+        render_scan_results();
+    }
+    update_scan_button();
+    await with_device_lock(() => send_feature_command(SET_WEB_SCAN, [[UINT8, bt_scanning ? 1 : 0]]));
+    bt_tick();
+}
+
+async function bt_connect(r) {
+    bt_connect_pending = format_bt_address(r.addr);
+    bt_connect_pending_since = Date.now();
+    render_scan_results();
+    await with_device_lock(() => send_feature_command(CONNECT_DEVICE, [[UINT8, r.addr_type], ...r.addr.map(b => [UINT8, b])]));
+    bt_tick();
+}
+
+function is_input_device(r) {
+    // HID service advertised, or appearance in the "Human Interface Device" category (0x03C0-0x03FF)
+    return (r.flags & (SCAN_RESULT_FLAG_HID_IN_ADV | SCAN_RESULT_FLAG_HID_IN_SCAN_RSP)) || ((r.appearance >> 6) == 0x0F);
+}
+
+function add_badge(container, text, style, title = '') {
+    const badge = document.createElement("span");
+    badge.className = "badge me-1 " + style;
+    badge.textContent = text;
+    if (title) {
+        badge.title = title;
+    }
+    container.appendChild(badge);
+}
+
+function render_scan_section() {
+    const container = document.getElementById("bt_scan_container");
+    container.classList.toggle("d-none", !is_bluetooth_device());
+    const supported = bt_events_supported;
+    document.getElementById("bt_scan_toggle").disabled = !supported || (device == null) || !bt_history_loaded;
+    if (!supported) {
+        document.getElementById("bt_scan_status").textContent = "The firmware on this device doesn't support scanning from here. Flash the latest firmware.";
+    }
+    update_scan_button();
+}
+
+function render_scan_results() {
+    const list = document.getElementById("bt_scan_list");
+    list.replaceChildren();
+    if (!bt_scanning && bt_scan_results.length == 0) {
+        return;
+    }
+    const hid_only = document.getElementById("bt_scan_hid_only").checked;
+    const shown = bt_scan_results.filter(r => !hid_only || is_input_device(r)).sort((a, b) => b.rssi - a.rssi);
+    const hidden_count = bt_scan_results.length - shown.length;
+
+    if (shown.length == 0) {
+        const li = document.createElement("li");
+        li.className = "list-group-item text-muted";
+        li.textContent = bt_scanning ? "Scanning… nothing found yet." : "Nothing found.";
+        if (hidden_count > 0) {
+            li.textContent += ` (${hidden_count} other device${hidden_count == 1 ? "" : "s"} hidden.)`;
+        }
+        list.appendChild(li);
+        return;
+    }
+
+    const template = document.getElementById("bt_scan_result_template");
+    for (const r of shown) {
+        const addr = format_bt_address(r.addr);
+        const element = template.content.cloneNode(true).firstElementChild;
+        element.querySelector(".bt_scan_name").textContent = r.name || "Unnamed device";
+        element.querySelector(".bt_scan_details").textContent = `${addr}  ${r.rssi} dBm`;
+
+        const badges = element.querySelector(".bt_scan_badges");
+        let notes = [];
+        if (r.flags & SCAN_RESULT_FLAG_CONNECTED) {
+            add_badge(badges, "Connected", "text-bg-success");
+        } else if (r.flags & SCAN_RESULT_FLAG_PAIRED) {
+            add_badge(badges, "Paired", "text-bg-info");
+        }
+        if (r.flags & SCAN_RESULT_FLAG_HID_IN_ADV) {
+            add_badge(badges, "Input device", "text-bg-primary");
+        } else if (r.flags & SCAN_RESULT_FLAG_HID_IN_SCAN_RSP) {
+            add_badge(badges, "Input device", "text-bg-warning");
+            notes.push("Only says it's an input device when asked for details, so the remapper's normal pairing mode (button or \"Pair new device\") can't find it. Connect from here instead.");
+        } else if (is_input_device(r)) {
+            add_badge(badges, "Input device?", "text-bg-secondary");
+            notes.push("Looks like an input device but doesn't advertise the HID service. It may not be in pairing mode yet.");
+        }
+        if (!(r.flags & SCAN_RESULT_FLAG_CONNECTABLE)) {
+            add_badge(badges, "Not connectable", "text-bg-secondary");
+            notes.push("Not accepting connections right now. Put it in pairing mode.");
+        }
+        element.querySelector(".bt_scan_note").textContent = notes.join(" ");
+
+        const button = element.querySelector(".bt_scan_connect");
+        const connecting = bt_connect_pending == addr;
+        button.textContent = connecting ? "Connecting…" : "Connect";
+        button.disabled = (bt_connect_pending != null) || !(r.flags & SCAN_RESULT_FLAG_CONNECTABLE) || !!(r.flags & SCAN_RESULT_FLAG_CONNECTED);
+        button.addEventListener("click", () => bt_connect(r));
+        list.appendChild(element);
+    }
+    if (hidden_count > 0) {
+        const li = document.createElement("li");
+        li.className = "list-group-item text-muted small";
+        li.textContent = `${hidden_count} other device${hidden_count == 1 ? "" : "s"} hidden.`;
+        list.appendChild(li);
+    }
+}
+
+function hci_reason(code) {
+    if (code < 0) {
+        return `error ${code}`;
+    }
+    const hex = "0x" + code.toString(16).padStart(2, '0').toUpperCase();
+    return (HCI_REASONS[code] || "error") + ` (${hex})`;
+}
+
+function security_reason(code) {
+    return (SECURITY_ERRORS[code] || "error") + ` (${code})`;
+}
+
+// returns [text, style] where style is "", "success" or "danger"
+function describe_bt_event(e) {
+    const addr = format_bt_address(e.addr);
+    const who = bt_known_names[addr] ? `${bt_known_names[addr]} (${addr})` : addr;
+    switch (e.type) {
+        case BT_EVENT.WEB_SCAN_STARTED: return ["Started scanning.", ""];
+        case BT_EVENT.WEB_SCAN_ENDED: return [e.value ? "Stopped scanning (the config tool stopped checking in)." : "Stopped scanning.", ""];
+        case BT_EVENT.CONNECTING: return [`Connecting to ${who}…`, ""];
+        case BT_EVENT.CONNECT_FAILED: return [`Couldn't connect to ${who}: ${hci_reason(e.value)}.`, "danger"];
+        case BT_EVENT.CONNECTED: return [`Connected to ${who}. Securing the connection…`, ""];
+        case BT_EVENT.SECURITY_CHANGED: return [`Connection to ${who} is encrypted (security level ${e.value}). Setting up input…`, ""];
+        case BT_EVENT.SECURITY_FAILED: return [`Couldn't secure the connection to ${who}: ${security_reason(e.value)}.`, "danger"];
+        case BT_EVENT.PASSKEY_DISPLAY: return [`${who} wants a passkey: type ${String(e.value).padStart(6, '0')} on it and press Enter.`, ""];
+        case BT_EVENT.PAIRING_CANCELLED: return [`Pairing with ${who} was cancelled.`, "danger"];
+        case BT_EVENT.PAIRING_COMPLETE: return [e.value ? `Paired with ${who}.` : `Paired with ${who}, but it didn't allow saving the pairing; it will need to pair again next time.`, e.value ? "success" : "danger"];
+        case BT_EVENT.PAIRING_FAILED: return [`Pairing with ${who} failed: ${security_reason(e.value)}.`, "danger"];
+        case BT_EVENT.HID_SETUP_FAILED: return [e.value == -1 ? `${who} doesn't offer a HID (input device) service, so the remapper can't use it.` : `Setting up ${who} as an input device failed (error ${e.value}).`, "danger"];
+        case BT_EVENT.READY: return [`${who} is ready. Its input now goes through the remapper.`, "success"];
+        case BT_EVENT.DISCONNECTED: return [`${who} disconnected: ${hci_reason(e.value)}.`, ""];
+        case BT_EVENT.FORGOTTEN: return [`Forgot ${who}.`, ""];
+        case BT_EVENT.ALL_FORGOTTEN: return ["Forgot all devices.", ""];
+        default: return [`Unknown event ${e.type} for ${who} (value ${e.value}).`, ""];
+    }
+}
+
+function handle_bt_event(e, live) {
+    const [text, style] = describe_bt_event(e);
+    const seconds = (e.time_ms / 1000).toFixed(1).padStart(7, '\u00a0');
+    add_log_line(`[${seconds}s] ${text}`, style);
+    if (live) {
+        act_on_bt_event(e);
+    }
+}
+
+function add_log_line(text, style) {
+    const log = document.getElementById("bt_event_log");
+    const line = document.createElement("div");
+    if (style) {
+        line.className = "text-" + style;
+    }
+    line.textContent = text;
+    const at_bottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    log.appendChild(line);
+    while (log.childElementCount > 200) {
+        log.firstElementChild.remove();
+    }
+    if (at_bottom) {
+        log.scrollTop = log.scrollHeight;
+    }
+}
+
+function act_on_bt_event(e) {
+    const addr = format_bt_address(e.addr);
+    const passkey = document.getElementById("bt_passkey");
+    if (e.type == BT_EVENT.PASSKEY_DISPLAY) {
+        passkey.replaceChildren();
+        passkey.append(`${bt_known_names[addr] || addr} wants a passkey. Type `);
+        const code = document.createElement("strong");
+        code.className = "fs-4 font-monospace";
+        code.textContent = String(e.value).padStart(6, '0');
+        passkey.append(code, " on it, then press Enter.");
+        passkey.classList.remove("d-none");
+    } else if ([BT_EVENT.PAIRING_COMPLETE, BT_EVENT.PAIRING_FAILED, BT_EVENT.PAIRING_CANCELLED, BT_EVENT.SECURITY_FAILED,
+                BT_EVENT.SECURITY_CHANGED, BT_EVENT.DISCONNECTED, BT_EVENT.WEB_SCAN_ENDED].includes(e.type)) {
+        passkey.classList.add("d-none");
+    }
+
+    if ([BT_EVENT.CONNECT_FAILED, BT_EVENT.SECURITY_FAILED, BT_EVENT.PAIRING_FAILED, BT_EVENT.PAIRING_CANCELLED,
+         BT_EVENT.HID_SETUP_FAILED, BT_EVENT.READY, BT_EVENT.DISCONNECTED, BT_EVENT.WEB_SCAN_ENDED].includes(e.type)) {
+        if ((bt_connect_pending == addr) || ((e.type == BT_EVENT.WEB_SCAN_ENDED) && bt_scan_confirmed)) {
+            bt_connect_pending = null;
+        }
+    }
+    if (e.type == BT_EVENT.WEB_SCAN_STARTED) {
+        bt_scan_confirmed = bt_scanning;
+    }
+    if ((e.type == BT_EVENT.WEB_SCAN_ENDED) && bt_scan_confirmed) {
+        bt_scanning = false;
+        bt_scan_confirmed = false;
+    }
 }
 
 function file_uploaded() {
@@ -1611,6 +2020,8 @@ function setup_examples() {
 function hid_on_disconnect(event) {
     if (event.device === device) {
         device = null;
+        bt_scanning = false;
+        bt_connect_pending = null;
         device_buttons_set_disabled_state(true);
     }
 }
@@ -1627,6 +2038,7 @@ function device_buttons_set_disabled_state(state) {
 function bluetooth_buttons_set_visibility(visible) {
     if (!visible) {
         document.getElementById("paired_devices_container").classList.add("d-none");
+        document.getElementById("bt_scan_container").classList.add("d-none");
     } else if (document.getElementById("nav-actions-tab").classList.contains("active")) {
         actions_tab_shown();
     }

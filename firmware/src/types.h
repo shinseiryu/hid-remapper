@@ -34,6 +34,10 @@ enum class ConfigCommand : int8_t {
     GET_QUIRK = 25,
     GET_PAIRED_DEVICE = 26,
     FORGET_DEVICE = 27,
+    SET_WEB_SCAN = 28,
+    GET_SCAN_RESULT = 29,
+    CONNECT_DEVICE = 30,
+    GET_BT_EVENT = 31,
 };
 
 struct usage_def_t {
@@ -427,10 +431,67 @@ struct __attribute__((packed)) paired_device_t {
     char name[PAIRED_DEVICE_NAME_LEN];  // not NUL-terminated when it fills the whole field
 };
 
-struct __attribute__((packed)) forget_device_t {
+// FORGET_DEVICE, CONNECT_DEVICE
+struct __attribute__((packed)) device_address_t {
     uint8_t addr_type;
     uint8_t addr[6];
 };
+
+struct __attribute__((packed)) set_web_scan_t {
+    uint8_t enabled;  // 1 = start, or keep going if already started; 0 = stop
+};
+
+#define SCAN_RESULT_NAME_LEN 16
+
+#define SCAN_RESULT_FLAG_CONNECTABLE (1 << 0)
+#define SCAN_RESULT_FLAG_HID_IN_ADV (1 << 1)       // HID service UUID in the advertising packet
+#define SCAN_RESULT_FLAG_HID_IN_SCAN_RSP (1 << 2)  // HID service UUID in the scan response
+#define SCAN_RESULT_FLAG_PAIRED (1 << 3)
+#define SCAN_RESULT_FLAG_CONNECTED (1 << 4)
+#define SCAN_RESULT_FLAG_GOT_SCAN_RSP (1 << 5)
+
+struct __attribute__((packed)) scan_result_t {
+    uint8_t valid;  // 0 = no result at this index
+    uint8_t addr_type;
+    uint8_t addr[6];
+    int8_t rssi;
+    uint8_t flags;
+    uint16_t appearance;
+    char name[SCAN_RESULT_NAME_LEN];  // not NUL-terminated when it fills the whole field
+};
+
+enum class BtEvent : uint8_t {
+    NONE = 0,
+    WEB_SCAN_STARTED = 1,
+    WEB_SCAN_ENDED = 2,      // value: 0 = stopped, 1 = timed out
+    CONNECTING = 3,
+    CONNECT_FAILED = 4,      // value: HCI error code, or negative errno
+    CONNECTED = 5,
+    SECURITY_CHANGED = 6,    // value: security level
+    SECURITY_FAILED = 7,     // value: bt_security_err
+    PASSKEY_DISPLAY = 8,     // value: passkey
+    PAIRING_CANCELLED = 9,
+    PAIRING_COMPLETE = 10,   // value: 1 = bonded
+    PAIRING_FAILED = 11,     // value: bt_security_err
+    HID_SETUP_FAILED = 12,   // value: -1 = no HID service, otherwise error code
+    READY = 13,
+    DISCONNECTED = 14,       // value: HCI reason
+    FORGOTTEN = 15,
+    ALL_FORGOTTEN = 16,
+};
+
+struct __attribute__((packed)) bt_event_t {
+    uint32_t seq;  // 0 = no event
+    uint32_t time_ms;
+    BtEvent type;
+    uint8_t addr_type;
+    uint8_t addr[6];
+    int32_t value;
+};
+
+static_assert(sizeof(paired_device_t) <= 28);
+static_assert(sizeof(scan_result_t) <= 28);
+static_assert(sizeof(bt_event_t) <= 28);
 
 struct __attribute__((packed)) monitor_t {
     uint8_t enabled;

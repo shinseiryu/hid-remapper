@@ -939,6 +939,16 @@ uint16_t handle_get_report1(uint8_t report_id, uint8_t* buffer, uint16_t reqlen)
                 get_paired_device(requested_index, (paired_device_t*) config_buffer);
                 break;
             }
+            case ConfigCommand::GET_SCAN_RESULT: {
+                // all zeros (valid=0) means there's no result at this index
+                get_scan_result(requested_index, (scan_result_t*) config_buffer);
+                break;
+            }
+            case ConfigCommand::GET_BT_EVENT: {
+                // returns the oldest event with seq >= requested_index; all zeros if there's none
+                get_bt_event(requested_index, (bt_event_t*) config_buffer);
+                break;
+            }
             case ConfigCommand::PERSIST_CONFIG: {
                 persist_config_response_t* returned = (persist_config_response_t*) config_buffer;
                 if (persist_config_return_code == PersistConfigReturnCode::UNKNOWN) {
@@ -1005,7 +1015,9 @@ void handle_set_report1(uint8_t report_id, uint8_t const* buffer, uint16_t bufsi
                 case ConfigCommand::GET_OUR_USAGES:
                 case ConfigCommand::GET_THEIR_USAGES:
                 case ConfigCommand::GET_QUIRK:
-                case ConfigCommand::GET_PAIRED_DEVICE: {
+                case ConfigCommand::GET_PAIRED_DEVICE:
+                case ConfigCommand::GET_SCAN_RESULT:
+                case ConfigCommand::GET_BT_EVENT: {
                     get_indexed_t* get_indexed = (get_indexed_t*) config_buffer->data;
                     requested_index = get_indexed->requested_index;
                     break;
@@ -1029,8 +1041,18 @@ void handle_set_report1(uint8_t report_id, uint8_t const* buffer, uint16_t bufsi
                     clear_bonds();
                     break;
                 case ConfigCommand::FORGET_DEVICE: {
-                    forget_device_t* forget = (forget_device_t*) config_buffer->data;
+                    device_address_t* forget = (device_address_t*) config_buffer->data;
                     forget_device(forget->addr_type, forget->addr);
+                    break;
+                }
+                case ConfigCommand::SET_WEB_SCAN: {
+                    set_web_scan_t* web_scan = (set_web_scan_t*) config_buffer->data;
+                    set_web_scan(web_scan->enabled);
+                    break;
+                }
+                case ConfigCommand::CONNECT_DEVICE: {
+                    device_address_t* target = (device_address_t*) config_buffer->data;
+                    connect_device(target->addr_type, target->addr);
                     break;
                 }
                 case ConfigCommand::FLASH_B_SIDE:

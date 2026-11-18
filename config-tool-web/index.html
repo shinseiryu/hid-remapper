@@ -304,6 +304,35 @@
                     </div>
                 </div>
 
+                <div class="row mt-4 d-none" id="bt_scan_container">
+                    <div class="col-8">
+                        <h5>Find devices</h5>
+                        <p class="text-muted small" id="bt_scan_status">Scan for nearby Bluetooth devices and pick the one to connect to. Put the device in pairing mode first.</p>
+                        <div class="d-flex align-items-center gap-3 mb-3">
+                            <button id="bt_scan_toggle" type="button" class="btn btn-primary">Scan for devices</button>
+                            <div class="form-check mb-0">
+                                <input class="form-check-input" type="checkbox" id="bt_scan_hid_only" checked>
+                                <label class="form-check-label" for="bt_scan_hid_only">Only show keyboards, mice and other input devices</label>
+                            </div>
+                        </div>
+                        <div id="bt_passkey" class="alert alert-warning d-none" role="alert"></div>
+                        <ul class="list-group" id="bt_scan_list"></ul>
+                        <h6 class="mt-4">Activity</h6>
+                        <div id="bt_event_log" class="border rounded p-2 small font-monospace overflow-auto" style="max-height: 16em;"></div>
+                    </div>
+                </div>
+
+                <template id="bt_scan_result_template">
+                    <li class="list-group-item d-flex align-items-center">
+                        <div class="me-auto">
+                            <div><span class="bt_scan_name fw-semibold"></span> <span class="bt_scan_badges"></span></div>
+                            <div class="bt_scan_details text-muted small font-monospace"></div>
+                            <div class="bt_scan_note text-muted small"></div>
+                        </div>
+                        <button type="button" class="bt_scan_connect btn btn-outline-primary btn-sm">Connect</button>
+                    </li>
+                </template>
+
                 <template id="paired_device_template">
                     <li class="list-group-item d-flex align-items-center">
                         <div class="me-auto">
