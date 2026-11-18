@@ -478,6 +478,7 @@ enum class BtEvent : uint8_t {
     DISCONNECTED = 14,       // value: HCI reason
     FORGOTTEN = 15,
     ALL_FORGOTTEN = 16,
+    CONN_PARAMS_UPDATED = 17,  // value: connection interval in 1.25 ms units
 };
 
 struct __attribute__((packed)) bt_event_t {

@@ -163,7 +163,42 @@ static K_MUTEX_DEFINE(scan_results_mutex);
 static bt_addr_le_t web_connect_addr;
 
 
-static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(6, 6, 44, 400);
+// Connect with a relaxed 30-50 ms interval: some devices (like the Lenovo Wireless
+// Keyboard) never answer when the very first connection uses 7.5 ms. Once a device is
+// set up, we ask for fast_conn_param to keep input latency low.
+static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(24, 40, 0, 400);
+static struct bt_le_conn_param* fast_conn_param = BT_LE_CONN_PARAM(6, 6, 44, 400);
+
+// Some devices (the Lenovo again) can't run at 7.5 ms at all and time out a few
+// seconds after switching. So we don't switch devices that asked for their own
+// parameters, and we stop trying with devices that timed out soon after switching.
+static const int FAST_PARAMS_TIMEOUT_WINDOW_MS = 15000;
+#define NO_FAST_PARAMS_MAX 8
+static bool peer_requested_params[CONFIG_BT_MAX_CONN];
+static int64_t fast_params_requested_at[CONFIG_BT_MAX_CONN];
+static bt_addr_le_t no_fast_params[NO_FAST_PARAMS_MAX];
+static int no_fast_params_count = 0;
+static int no_fast_params_next = 0;
+
+static bool fast_params_unwanted(const bt_addr_le_t* addr) {
+    for (int i = 0; i < no_fast_params_count; i++) {
+        if (!bt_addr_le_cmp(&no_fast_params[i], addr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void remember_fast_params_unwanted(const bt_addr_le_t* addr) {
+    if (fast_params_unwanted(addr)) {
+        return;
+    }
+    no_fast_params[no_fast_params_next] = *addr;
+    no_fast_params_next = (no_fast_params_next + 1) % NO_FAST_PARAMS_MAX;
+    if (no_fast_params_count < NO_FAST_PARAMS_MAX) {
+        no_fast_params_count++;
+    }
+}
 
 static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
@@ -273,7 +308,14 @@ static bool scan_setup_filters() {
 
     uint8_t filter_mode = BT_SCAN_UUID_FILTER;
 
-    if (peers_only && (bonded_count > 0)) {
+    // We only look for new devices when explicitly asked to (button). New devices are
+    // normally paired from the config tool's scan list, so we don't go into pairing
+    // mode on our own just because nothing is paired.
+    if (peers_only) {
+        if (bonded_count == 0) {
+            LOG_DBG("no bonded peers, not scanning");
+            return false;
+        }
         if (conn_count == bonded_count) {
             LOG_DBG("all bonded peers connected, not scanning");
             return false;
@@ -282,7 +324,6 @@ static bool scan_setup_filters() {
         LOG_DBG("scanning for bonded peers only");
     } else {
         LOG_DBG("scanning for new peers");
-        peers_only = false;
     }
 
     if (!CHK(bt_scan_filter_enable(filter_mode, true))) {
@@ -729,6 +770,8 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
 
     LOG_INF("%s", addr);
     log_bt_event(BtEvent::CONNECTED, bt_conn_get_dst(conn), 0);
+    peer_requested_params[bt_conn_index(conn)] = false;
+    fast_params_requested_at[bt_conn_index(conn)] = 0;
 
     CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
 }
@@ -740,6 +783,12 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     LOG_INF("%s (reason=%u)", addr, reason);
     log_bt_event(BtEvent::DISCONNECTED, bt_conn_get_dst(conn), reason);
+    int64_t fast_at = fast_params_requested_at[bt_conn_index(conn)];
+    if ((reason == BT_HCI_ERR_CONN_TIMEOUT) && (fast_at != 0) && (k_uptime_get() - fast_at < FAST_PARAMS_TIMEOUT_WINDOW_MS)) {
+        LOG_WRN("%s timed out soon after switching to fast connection parameters, won't do that again", addr);
+        remember_fast_params_unwanted(bt_conn_get_dst(conn));
+    }
+    fast_params_requested_at[bt_conn_index(conn)] = 0;
     web_connect_done();
 
     uint8_t conn_idx = bt_conn_index(conn);
@@ -775,11 +824,13 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
 
 static void le_param_updated(struct bt_conn* conn, uint16_t interval, uint16_t latency, uint16_t timeout) {
     LOG_INF("interval=%u, latency=%u, timeout=%u", interval, latency, timeout);
+    log_bt_event(BtEvent::CONN_PARAMS_UPDATED, bt_conn_get_dst(conn), interval);
 }
 
 static bool le_param_req(struct bt_conn* conn, struct bt_le_conn_param* param) {
     LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", param->interval_min, param->interval_max, param->latency, param->timeout);
     param->interval_max = param->interval_min;
+    peer_requested_params[bt_conn_index(conn)] = true;
     return true;
 }
 
@@ -1164,6 +1215,17 @@ static void hogp_ready_work_fn(struct k_work* work) {
 
         log_bt_event(BtEvent::READY, bt_conn_get_dst(bt_hogp_conn(item.hogp)), 0);
         web_connect_done();
+
+        // now that it's set up, ask for the fast interval (see conn_param)
+        struct bt_conn* conn = bt_hogp_conn(item.hogp);
+        uint8_t conn_idx = bt_conn_index(conn);
+        if (peer_requested_params[conn_idx]) {
+            LOG_INF("device chose its own connection parameters, keeping them");
+        } else if (fast_params_unwanted(bt_conn_get_dst(conn))) {
+            LOG_INF("device timed out with fast connection parameters before, not switching");
+        } else if (CHK(bt_conn_le_param_update(conn, fast_conn_param))) {
+            fast_params_requested_at[conn_idx] = k_uptime_get();
+        }
     }
 }
 static K_WORK_DEFINE(hogp_ready_work, hogp_ready_work_fn);

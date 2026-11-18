@@ -15,13 +15,15 @@ The Bluetooth version of the remapper runs on Nordic's nRF52840 chip. Currently 
 
 To flash the [firmware](firmware-bluetooth), first put the board in flashing mode by double clicking the reset button quickly. A drive should appear on your computer. Copy the [UF2 file that matches your board](https://github.com/jfedor2/hid-remapper/releases/latest) to that drive and that's it. If you want to flash a newer version of the firmware in the future, you can also put the board in firmware flashing mode using the HID Remapper [web configuration tool](https://www.remapper.org/config/).
 
-To connect Bluetooth devices to the remapper, you need to put the device in pairing mode. This is device-specific, but usually involves holding a button for a few seconds. Then you also need to put HID Remapper in pairing mode. You do this by either pressing the "user switch" button on the board or by clicking the "Pair new device" button on the web configuration tool (the Xiao board doesn't have a user button so you have to either do it through the web interface or by shorting pin 0 to GND). The remapper will also automatically enter pairing mode if no devices are currently paired.
+To connect a Bluetooth device to the remapper, put the device in pairing mode (this is device-specific, but usually involves holding a button for a few seconds). Then open the [web configuration tool](https://www.remapper.org/config/), go to the "Actions" tab, click "Scan for devices", and click "Connect" next to your device. The "Activity" log below the list shows each step of connecting and pairing, and why it failed if it did. If the device asks for a passkey, the tool shows the code to type on it.
 
-You can tell the remapper is in pairing mode if the blue LED is lit constantly. When it's not in pairing mode, the blue LED will be blinking, with the number of blinks per cycle corresponding to the number of currently connected devices.
+Paired devices reconnect automatically when they wake up or come back in range. The remapper doesn't pair new devices on its own.
 
-To make the remapper forget all currently paired devices, hold the "user switch" button for over 3 seconds, or click the "Forget all devices" button on the web configuration tool (or short pin 0 to GND for over 3 seconds on the Seeed Xiao board).
+If you don't have a computer with the web configuration tool at hand, you can also put the remapper in pairing mode by pressing the "user switch" button on the board (on the Seeed Xiao, which doesn't have one, short pin 0 to GND). In this mode it connects to the first Bluetooth input device in pairing mode that it finds. You can tell the remapper is in pairing mode if the blue LED is lit constantly. When it's not in pairing mode, the blue LED will be blinking, with the number of blinks per cycle corresponding to the number of currently connected devices.
 
-The "Actions" tab of the web configuration tool lists the currently paired devices, shows which of them are connected, and lets you forget a single device. Device names are read from the device after it connects, so a newly paired device can show up as "Unnamed device" for a moment.
+The "Actions" tab also lists the paired devices, shows which of them are connected, and lets you forget a single device. Device names are read from the device after it connects, so a newly paired device can show up as "Unnamed device" for a moment.
+
+To make the remapper forget all paired devices, click "Forget all devices" in the web configuration tool, or hold the "user switch" button for over 3 seconds (or short pin 0 to GND for over 3 seconds on the Seeed Xiao board).
 
 ## Known issues
 

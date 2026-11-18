@@ -93,6 +93,7 @@ const BT_EVENT = {
     DISCONNECTED: 14,
     FORGOTTEN: 15,
     ALL_FORGOTTEN: 16,
+    CONN_PARAMS_UPDATED: 17,
 };
 
 // Bluetooth spec HCI error codes, the ones likely to show up here
@@ -268,7 +269,6 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("upload_json").addEventListener("click", upload_json);
     document.getElementById("flash_firmware").addEventListener("click", flash_firmware);
     document.getElementById("flash_b_side").addEventListener("click", flash_b_side);
-    document.getElementById("pair_new_device").addEventListener("click", pair_new_device);
     document.getElementById("clear_bonds").addEventListener("click", clear_bonds);
     document.getElementById("bt_scan_toggle").addEventListener("click", bt_scan_toggle);
     document.getElementById("bt_scan_hid_only").addEventListener("change", render_scan_results);
@@ -948,10 +948,6 @@ async function flash_b_side() {
     await send_feature_command(FLASH_B_SIDE);
 }
 
-async function pair_new_device() {
-    await with_device_lock(() => send_feature_command(PAIR_NEW_DEVICE));
-}
-
 async function clear_bonds() {
     await with_device_lock(() => send_feature_command(CLEAR_BONDS));
     // the firmware does the unpairing asynchronously
@@ -1172,7 +1168,7 @@ function render_paired_devices(devices) {
         return;
     }
     if (devices.length == 0) {
-        status.innerText = "No paired devices.";
+        status.innerText = "No paired devices. Use \"Scan for devices\" below to pair one.";
         return;
     }
     status.innerText = "Updates every few seconds while this tab is open.";
@@ -1352,6 +1348,7 @@ function describe_bt_event(e) {
         case BT_EVENT.DISCONNECTED: return [`${who} disconnected: ${hci_reason(e.value)}.`, ""];
         case BT_EVENT.FORGOTTEN: return [`Forgot ${who}.`, ""];
         case BT_EVENT.ALL_FORGOTTEN: return ["Forgot all devices.", ""];
+        case BT_EVENT.CONN_PARAMS_UPDATED: return [`Connection interval for ${who} is now ${(e.value * 1.25).toFixed(2).replace(/\.?0+$/, '')} ms.`, ""];
         default: return [`Unknown event ${e.type} for ${who} (value ${e.value}).`, ""];
     }
 }
@@ -2031,7 +2028,6 @@ function device_buttons_set_disabled_state(state) {
     document.getElementById("save_to_device").disabled = state;
     document.getElementById("flash_firmware").disabled = state;
     document.getElementById("flash_b_side").disabled = state;
-    document.getElementById("pair_new_device").disabled = state;
     document.getElementById("clear_bonds").disabled = state;
 }
 
@@ -2042,7 +2038,6 @@ function bluetooth_buttons_set_visibility(visible) {
     } else if (document.getElementById("nav-actions-tab").classList.contains("active")) {
         actions_tab_shown();
     }
-    document.getElementById("pair_new_device_container").classList.toggle("d-none", !visible);
     document.getElementById("clear_bonds_container").classList.toggle("d-none", !visible);
     document.getElementById("flash_b_side_container").classList.toggle("d-none", visible);
 }
