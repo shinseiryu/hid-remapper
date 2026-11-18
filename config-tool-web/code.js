@@ -25,6 +25,8 @@ const IGNORE_AUTH_DEV_INPUTS_FLAG = 1 << 4;
 const GPIO_OUTPUT_MODE_FLAG = 1 << 5;
 const NORMALIZE_GAMEPAD_INPUTS_FLAG = 1 << 6;
 const HUB_PORT_NONE = 255;
+const MAX_PAIRED_DEVICES = 32;
+const PAIRED_DEVICES_REFRESH_INTERVAL_MS = 3000;
 
 const QUIRK_FLAG_RELATIVE_MASK = 0b10000000;
 const QUIRK_FLAG_SIGNED_MASK = 0b01000000;
@@ -60,6 +62,8 @@ const SET_MONITOR_ENABLED = 22;
 const CLEAR_QUIRKS = 23;
 const ADD_QUIRK = 24;
 const GET_QUIRK = 25;
+const GET_PAIRED_DEVICE = 26;
+const FORGET_DEVICE = 27;
 
 const PERSIST_CONFIG_SUCCESS = 1;
 const PERSIST_CONFIG_CONFIG_TOO_BIG = 2;
@@ -174,6 +178,8 @@ let monitor_max_val = {};
 let unique_id_counter = 0;
 let save_to_device_checkmark_timeout_id = null;
 let busy = false;
+let paired_devices_supported = true;
+let paired_devices_timer = null;
 const ignored_usages = new Set([
 ]);
 let modal_return_mapping = null;
@@ -213,6 +219,8 @@ document.addEventListener("DOMContentLoaded", function () {
 
     document.getElementById("nav-monitor-tab").addEventListener("shown.bs.tab", monitor_tab_shown);
     document.getElementById("nav-monitor-tab").addEventListener("hide.bs.tab", monitor_tab_hide);
+    document.getElementById("nav-actions-tab").addEventListener("shown.bs.tab", actions_tab_shown);
+    document.getElementById("nav-actions-tab").addEventListener("hide.bs.tab", actions_tab_hide);
 
     document.getElementById("input-column-header").addEventListener("click", sort_by(['source_port', 'source_usage', 'target_usage', 'layers']));
     document.getElementById("output-column-header").addEventListener("click", sort_by(['target_usage', 'source_port', 'source_usage', 'layers']));
@@ -259,6 +267,7 @@ async function open_device() {
                 await get_usages_from_device();
                 setup_usages_modals();
                 bluetooth_buttons_set_visibility(device.productName.includes("Bluetooth"));
+                paired_devices_supported = true;
             }
         }
     } catch (e) {
@@ -859,11 +868,140 @@ async function flash_b_side() {
 }
 
 async function pair_new_device() {
-    await send_feature_command(PAIR_NEW_DEVICE);
+    await with_device_lock(() => send_feature_command(PAIR_NEW_DEVICE));
 }
 
 async function clear_bonds() {
-    await send_feature_command(CLEAR_BONDS);
+    await with_device_lock(() => send_feature_command(CLEAR_BONDS));
+    // the firmware does the unpairing asynchronously
+    setTimeout(refresh_paired_devices, 1500);
+}
+
+// Waits for any other device communication to finish, so that our command
+// and its response don't get interleaved with someone else's.
+async function with_device_lock(fn) {
+    while (busy) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    if (device == null) {
+        return;
+    }
+    busy = true;
+    try {
+        return await fn();
+    } catch (e) {
+        display_error(e);
+    } finally {
+        busy = false;
+    }
+}
+
+function is_bluetooth_device() {
+    return (device != null) && device.productName.includes("Bluetooth");
+}
+
+function actions_tab_shown() {
+    refresh_paired_devices();
+    if (paired_devices_timer == null) {
+        paired_devices_timer = setInterval(refresh_paired_devices, PAIRED_DEVICES_REFRESH_INTERVAL_MS);
+    }
+}
+
+function actions_tab_hide() {
+    if (paired_devices_timer != null) {
+        clearInterval(paired_devices_timer);
+        paired_devices_timer = null;
+    }
+}
+
+function format_bt_address(addr_bytes) {
+    // stored little-endian, displayed most significant byte first
+    return addr_bytes.slice().reverse().map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
+}
+
+async function read_paired_devices() {
+    let devices = [];
+    for (let i = 0; i < MAX_PAIRED_DEVICES; i++) {
+        await send_feature_command(GET_PAIRED_DEVICE, [[UINT32, i]]);
+        const bytes = await read_config_feature(new Array(CONFIG_SIZE - 4).fill(UINT8));
+        const [valid, connected, addr_type] = bytes;
+        if (!valid) {
+            break;
+        }
+        const addr = bytes.slice(3, 9);
+        let name = '';
+        for (const b of bytes.slice(9)) {
+            if (b == 0) {
+                break;
+            }
+            name += String.fromCharCode(b);
+        }
+        // names are UTF-8
+        try {
+            name = decodeURIComponent(escape(name));
+        } catch (e) {
+        }
+        devices.push({ connected: !!connected, addr_type: addr_type, addr: addr, name: name });
+    }
+    return devices;
+}
+
+async function refresh_paired_devices() {
+    if (!is_bluetooth_device() || !paired_devices_supported || busy) {
+        return;
+    }
+    busy = true;
+    let devices = null;
+    try {
+        devices = await read_paired_devices();
+    } catch (e) {
+        // firmware from before this feature doesn't answer GET_PAIRED_DEVICE
+        paired_devices_supported = false;
+    } finally {
+        busy = false;
+    }
+    render_paired_devices(devices);
+}
+
+function render_paired_devices(devices) {
+    const container = document.getElementById("paired_devices_container");
+    const list = document.getElementById("paired_devices_list");
+    const status = document.getElementById("paired_devices_status");
+    container.classList.remove("d-none");
+    list.replaceChildren();
+
+    if (devices == null) {
+        status.innerText = "The firmware on this device can't list paired devices. Flash the latest firmware to see them here.";
+        return;
+    }
+    if (devices.length == 0) {
+        status.innerText = "No paired devices. Put a device in pairing mode, then click \"Pair new device\".";
+        return;
+    }
+    status.innerText = "Updates every few seconds while this tab is open.";
+
+    const template = document.getElementById("paired_device_template");
+    for (const d of devices) {
+        const element = template.content.cloneNode(true).firstElementChild;
+        // textContent, not innerHTML: the name comes from the Bluetooth device
+        element.querySelector(".paired_device_name").textContent = d.name || "Unnamed device";
+        element.querySelector(".paired_device_address").textContent =
+            format_bt_address(d.addr) + (d.addr_type == 0 ? " (public)" : " (random)");
+        const badge = element.querySelector(".paired_device_connected");
+        badge.textContent = d.connected ? "Connected" : "Not connected";
+        badge.classList.add(d.connected ? "text-bg-success" : "text-bg-secondary");
+        element.querySelector(".paired_device_forget").addEventListener("click", () => forget_device(d));
+        list.appendChild(element);
+    }
+}
+
+async function forget_device(d) {
+    if (!confirm(`Forget ${d.name || format_bt_address(d.addr)}? You'll have to pair it again to use it.`)) {
+        return;
+    }
+    await with_device_lock(() => send_feature_command(FORGET_DEVICE, [[UINT8, d.addr_type], ...d.addr.map(b => [UINT8, b])]));
+    // the firmware does the unpairing asynchronously
+    setTimeout(refresh_paired_devices, 1500);
 }
 
 function file_uploaded() {
@@ -1487,6 +1625,11 @@ function device_buttons_set_disabled_state(state) {
 }
 
 function bluetooth_buttons_set_visibility(visible) {
+    if (!visible) {
+        document.getElementById("paired_devices_container").classList.add("d-none");
+    } else if (document.getElementById("nav-actions-tab").classList.contains("active")) {
+        actions_tab_shown();
+    }
     document.getElementById("pair_new_device_container").classList.toggle("d-none", !visible);
     document.getElementById("clear_bonds_container").classList.toggle("d-none", !visible);
     document.getElementById("flash_b_side_container").classList.toggle("d-none", visible);

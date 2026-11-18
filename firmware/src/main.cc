@@ -209,6 +209,13 @@ void pair_new_device() {
 void clear_bonds() {
 }
 
+bool get_paired_device(uint32_t index, paired_device_t* device) {
+    return false;
+}
+
+void forget_device(uint8_t addr_type, const uint8_t* addr) {
+}
+
 void my_mutexes_init() {
     for (int i = 0; i < (int8_t) MutexId::N; i++) {
         mutex_init(&mutexes[i]);

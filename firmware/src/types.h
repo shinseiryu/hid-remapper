@@ -32,6 +32,8 @@ enum class ConfigCommand : int8_t {
     CLEAR_QUIRKS = 23,
     ADD_QUIRK = 24,
     GET_QUIRK = 25,
+    GET_PAIRED_DEVICE = 26,
+    FORGET_DEVICE = 27,
 };
 
 struct usage_def_t {
@@ -413,6 +415,21 @@ enum class PersistConfigReturnCode : int8_t {
 
 struct __attribute__((packed)) persist_config_response_t {
     PersistConfigReturnCode return_code;
+};
+
+#define PAIRED_DEVICE_NAME_LEN 19
+
+struct __attribute__((packed)) paired_device_t {
+    uint8_t valid;      // 0 = no paired device at this index
+    uint8_t connected;
+    uint8_t addr_type;
+    uint8_t addr[6];
+    char name[PAIRED_DEVICE_NAME_LEN];  // not NUL-terminated when it fills the whole field
+};
+
+struct __attribute__((packed)) forget_device_t {
+    uint8_t addr_type;
+    uint8_t addr[6];
 };
 
 struct __attribute__((packed)) monitor_t {

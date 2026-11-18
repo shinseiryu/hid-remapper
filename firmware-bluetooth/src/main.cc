@@ -36,6 +36,7 @@ static const int CLEAR_BONDS_BUTTON_PRESS_MS = 3000;
 
 // these macros don't work in C++ when used directly ("taking address of temporary array")
 static auto const BT_UUID_HIDS_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_HIDS_VAL);
+static auto const BT_UUID_GAP_DEVICE_NAME_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_GAP_DEVICE_NAME_VAL);
 static auto BT_ADDR_LE_ANY_ = BT_ADDR_LE_ANY[0];
 static auto BT_CONN_LE_CREATE_CONN_ = BT_CONN_LE_CREATE_CONN[0];
 
@@ -258,6 +259,225 @@ static void scan_stop_work_fn(struct k_work* work) {
 }
 static K_WORK_DEFINE(scan_stop_work, scan_stop_work_fn);
 
+// Names of paired devices, so that the config tool can show them. Read from the
+// GAP Device Name characteristic after connecting and stored in settings under
+// "remapper/name/<hex address>".
+struct device_name_type {
+    bool used;
+    bool dirty;       // needs to be saved to (or deleted from) settings
+    bool stale;       // stale_addr's settings entry needs to be deleted
+    bt_addr_le_t addr;
+    bt_addr_le_t stale_addr;
+    char name[PAIRED_DEVICE_NAME_LEN + 1];
+};
+static struct device_name_type device_names[CONFIG_BT_MAX_PAIRED];
+static K_MUTEX_DEFINE(device_names_mutex);
+static struct bt_gatt_read_params name_read_params[CONFIG_BT_MAX_CONN];
+
+#define DEVICE_NAME_KEY_PREFIX "remapper/name/"
+#define DEVICE_NAME_KEY_HEX_LEN (2 * (1 + sizeof(bt_addr_t)))
+
+static void device_name_key(const bt_addr_le_t* addr, char* key, size_t key_size) {
+    uint8_t raw[1 + sizeof(bt_addr_t)];
+    char hex[DEVICE_NAME_KEY_HEX_LEN + 1];
+    raw[0] = addr->type;
+    memcpy(raw + 1, addr->a.val, sizeof(bt_addr_t));
+    bin2hex(raw, sizeof(raw), hex, sizeof(hex));
+    snprintk(key, key_size, DEVICE_NAME_KEY_PREFIX "%s", hex);
+}
+
+// caller must hold device_names_mutex
+static struct device_name_type* device_name_find(const bt_addr_le_t* addr) {
+    for (int i = 0; i < CONFIG_BT_MAX_PAIRED; i++) {
+        if (device_names[i].used && !bt_addr_le_cmp(&device_names[i].addr, addr)) {
+            return &device_names[i];
+        }
+    }
+    return NULL;
+}
+
+struct bond_exists_ctx {
+    const bt_addr_le_t* addr;
+    bool found;
+};
+
+static void bond_exists_cb(const struct bt_bond_info* info, void* data) {
+    struct bond_exists_ctx* ctx = (struct bond_exists_ctx*) data;
+    if (!bt_addr_le_cmp(&info->addr, ctx->addr)) {
+        ctx->found = true;
+    }
+}
+
+static bool bond_exists(const bt_addr_le_t* addr) {
+    struct bond_exists_ctx ctx = { .addr = addr, .found = false };
+    bt_foreach_bond(BT_ID_DEFAULT, bond_exists_cb, &ctx);
+    return ctx.found;
+}
+
+static void persist_device_names_work_fn(struct k_work* work) {
+    char key[sizeof(DEVICE_NAME_KEY_PREFIX) + DEVICE_NAME_KEY_HEX_LEN];
+    while (true) {
+        bool found = false;
+        bool used;
+        bt_addr_le_t addr;
+        char name[PAIRED_DEVICE_NAME_LEN + 1];
+
+        k_mutex_lock(&device_names_mutex, K_FOREVER);
+        for (int i = 0; i < CONFIG_BT_MAX_PAIRED; i++) {
+            struct device_name_type* entry = &device_names[i];
+            if (entry->stale) {
+                entry->stale = false;
+                found = true;
+                used = false;
+                addr = entry->stale_addr;
+                break;
+            }
+            if (entry->dirty) {
+                entry->dirty = false;
+                found = true;
+                used = entry->used;
+                addr = entry->addr;
+                memcpy(name, entry->name, sizeof(name));
+                break;
+            }
+        }
+        k_mutex_unlock(&device_names_mutex);
+
+        if (!found) {
+            break;
+        }
+
+        device_name_key(&addr, key, sizeof(key));
+        if (used) {
+            CHK(settings_save_one(key, name, strlen(name)));
+        } else {
+            CHK(settings_delete(key));
+        }
+    }
+}
+static K_WORK_DEFINE(persist_device_names_work, persist_device_names_work_fn);
+
+static void set_device_name(const bt_addr_le_t* addr, const char* name, size_t len) {
+    while ((len > 0) && (name[len - 1] == '\0')) {
+        len--;
+    }
+    if (len > PAIRED_DEVICE_NAME_LEN) {
+        len = PAIRED_DEVICE_NAME_LEN;
+    }
+
+    k_mutex_lock(&device_names_mutex, K_FOREVER);
+    struct device_name_type* entry = device_name_find(addr);
+    if (entry == NULL) {
+        for (int i = 0; i < CONFIG_BT_MAX_PAIRED; i++) {
+            if (!device_names[i].used) {
+                entry = &device_names[i];
+                break;
+            }
+        }
+    }
+    if (entry == NULL) {
+        // table full, reuse an entry belonging to a device we no longer have a bond with
+        for (int i = 0; i < CONFIG_BT_MAX_PAIRED; i++) {
+            if (!bond_exists(&device_names[i].addr)) {
+                entry = &device_names[i];
+                break;
+            }
+        }
+    }
+    if (entry == NULL) {
+        entry = &device_names[0];
+    }
+    if (entry->used && bt_addr_le_cmp(&entry->addr, addr)) {
+        entry->stale = true;
+        entry->stale_addr = entry->addr;
+    }
+    entry->used = true;
+    entry->dirty = true;
+    entry->addr = *addr;
+    memcpy(entry->name, name, len);
+    entry->name[len] = '\0';
+    k_mutex_unlock(&device_names_mutex);
+
+    k_work_submit(&persist_device_names_work);
+}
+
+static void forget_device_name(const bt_addr_le_t* addr) {
+    k_mutex_lock(&device_names_mutex, K_FOREVER);
+    for (int i = 0; i < CONFIG_BT_MAX_PAIRED; i++) {
+        // addr == BT_ADDR_LE_ANY means all of them
+        if (device_names[i].used && (!bt_addr_le_cmp(addr, &BT_ADDR_LE_ANY_) || !bt_addr_le_cmp(&device_names[i].addr, addr))) {
+            device_names[i].used = false;
+            device_names[i].dirty = true;
+        }
+    }
+    k_mutex_unlock(&device_names_mutex);
+
+    k_work_submit(&persist_device_names_work);
+}
+
+static int load_device_name(const char* hex, size_t len, settings_read_cb read_cb, void* cb_arg) {
+    uint8_t raw[1 + sizeof(bt_addr_t)];
+    char name[PAIRED_DEVICE_NAME_LEN + 1];
+
+    if ((strlen(hex) != DEVICE_NAME_KEY_HEX_LEN) || (hex2bin(hex, DEVICE_NAME_KEY_HEX_LEN, raw, sizeof(raw)) != sizeof(raw))) {
+        return -EINVAL;
+    }
+    if (len > PAIRED_DEVICE_NAME_LEN) {
+        return -EINVAL;
+    }
+    int bytes_read = read_cb(cb_arg, name, len);
+    if (bytes_read < 0) {
+        return bytes_read;
+    }
+
+    bt_addr_le_t addr;
+    addr.type = raw[0];
+    memcpy(addr.a.val, raw + 1, sizeof(bt_addr_t));
+
+    k_mutex_lock(&device_names_mutex, K_FOREVER);
+    for (int i = 0; i < CONFIG_BT_MAX_PAIRED; i++) {
+        if (!device_names[i].used) {
+            device_names[i].used = true;
+            device_names[i].addr = addr;
+            memcpy(device_names[i].name, name, bytes_read);
+            device_names[i].name[bytes_read] = '\0';
+            break;
+        }
+    }
+    k_mutex_unlock(&device_names_mutex);
+
+    return 0;
+}
+
+static uint8_t name_read_cb(struct bt_conn* conn, uint8_t err, struct bt_gatt_read_params* params, const void* data, uint16_t length) {
+    if (err) {
+        LOG_WRN("device name read failed, err=%u", err);
+        return BT_GATT_ITER_STOP;
+    }
+    if (data != NULL) {
+        set_device_name(bt_conn_get_dst(conn), (const char*) data, length);
+    }
+    return BT_GATT_ITER_STOP;
+}
+
+static void read_device_name(struct bt_conn* conn) {
+    k_mutex_lock(&device_names_mutex, K_FOREVER);
+    bool known = device_name_find(bt_conn_get_dst(conn)) != NULL;
+    k_mutex_unlock(&device_names_mutex);
+    if (known) {
+        return;
+    }
+
+    struct bt_gatt_read_params* params = &name_read_params[bt_conn_index(conn)];
+    memset(params, 0, sizeof(*params));
+    params->func = name_read_cb;
+    params->handle_count = 0;  // read by UUID
+    params->by_uuid.uuid = (const struct bt_uuid*) &BT_UUID_GAP_DEVICE_NAME_;
+    params->by_uuid.start_handle = 0x0001;
+    params->by_uuid.end_handle = 0xFFFF;
+    CHK(bt_gatt_read(conn, params));
+}
+
 static void disconnect_conn(struct bt_conn* conn, void* data) {
     CHK(bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
 }
@@ -268,12 +488,28 @@ static void clear_bonds_work_fn(struct k_work* work) {
     } else {
         return;
     }
+    forget_device_name(&BT_ADDR_LE_ANY_);
 
     scan_stop();
     bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
 static K_WORK_DEFINE(clear_bonds_work, clear_bonds_work_fn);
+
+static bt_addr_le_t addr_to_forget;
+
+static void forget_device_work_fn(struct k_work* work) {
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(&addr_to_forget, addr_str, sizeof(addr_str));
+
+    // bt_unpair() also disconnects the device if it's connected
+    if (CHK(bt_unpair(BT_ID_DEFAULT, &addr_to_forget))) {
+        LOG_INF("Forgot %s.", addr_str);
+    }
+    forget_device_name(&addr_to_forget);
+    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+}
+static K_WORK_DEFINE(forget_device_work, forget_device_work_fn);
 
 static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt_scan_filter_match* filter_match, bool connectable) {
     char addr[BT_ADDR_LE_STR_LEN];
@@ -349,6 +585,7 @@ static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
     LOG_INF("");
     patch_broken_uuids(dm);
     CHK(bt_hogp_handles_assign(dm, ((struct bt_hogp*) context)));  // XXX disconnect if this fails?
+    read_device_name(bt_gatt_dm_conn_get(dm));
     CHK(bt_gatt_dm_data_release(dm));
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
@@ -808,6 +1045,14 @@ static void bt_init() {
 }
 
 static int remapper_settings_set(const char* name, size_t len, settings_read_cb read_cb, void* cb_arg) {
+    const char* next;
+    if (settings_name_steq(name, "name", &next) && (next != NULL)) {
+        return load_device_name(next, len, read_cb, cb_arg);
+    }
+    if (!settings_name_steq(name, "config", &next) || (next != NULL)) {
+        return -ENOENT;
+    }
+
     LOG_INF("len=%d", len);
 
     static uint8_t buffer[PERSISTED_CONFIG_SIZE];
@@ -860,6 +1105,73 @@ void pair_new_device() {
 
 void clear_bonds() {
     k_work_submit(&clear_bonds_work);
+}
+
+struct bond_at_index_ctx {
+    uint32_t index;
+    uint32_t i;
+    bool found;
+    bt_addr_le_t addr;
+};
+
+static void bond_at_index_cb(const struct bt_bond_info* info, void* data) {
+    struct bond_at_index_ctx* ctx = (struct bond_at_index_ctx*) data;
+    if (ctx->i++ == ctx->index) {
+        ctx->found = true;
+        ctx->addr = info->addr;
+    }
+}
+
+struct is_connected_ctx {
+    const bt_addr_le_t* addr;
+    bool connected;
+};
+
+static void is_connected_cb(struct bt_conn* conn, void* data) {
+    struct is_connected_ctx* ctx = (struct is_connected_ctx*) data;
+    if (!bt_addr_le_cmp(bt_conn_get_dst(conn), ctx->addr)) {
+        ctx->connected = true;
+    }
+}
+
+bool get_paired_device(uint32_t index, paired_device_t* device) {
+    struct bond_at_index_ctx bond_ctx = { .index = index, .i = 0, .found = false };
+    bt_foreach_bond(BT_ID_DEFAULT, bond_at_index_cb, &bond_ctx);
+    if (!bond_ctx.found) {
+        return false;
+    }
+
+    // same notion of "connected" as the LED blink count
+    struct is_connected_ctx conn_ctx = { .addr = &bond_ctx.addr, .connected = false };
+    bt_conn_foreach(BT_CONN_TYPE_LE, is_connected_cb, &conn_ctx);
+
+    device->valid = 1;
+    device->connected = conn_ctx.connected;
+    device->addr_type = bond_ctx.addr.type;
+    memcpy(device->addr, bond_ctx.addr.a.val, sizeof(device->addr));
+
+    k_mutex_lock(&device_names_mutex, K_FOREVER);
+    struct device_name_type* entry = device_name_find(&bond_ctx.addr);
+    if (entry != NULL) {
+        for (size_t i = 0; (i < sizeof(device->name)) && (entry->name[i] != '\0'); i++) {
+            device->name[i] = entry->name[i];
+        }
+    }
+    k_mutex_unlock(&device_names_mutex);
+
+    return true;
+}
+
+void forget_device(uint8_t addr_type, const uint8_t* addr) {
+    bt_addr_le_t to_forget;
+    to_forget.type = addr_type;
+    memcpy(to_forget.a.val, addr, sizeof(to_forget.a.val));
+    // bt_unpair() would treat this as "forget everything"
+    if (!bt_addr_le_cmp(&to_forget, &BT_ADDR_LE_ANY_)) {
+        return;
+    }
+    addr_to_forget = to_forget;
+    k_work_submit(&forget_device_work);
 }
 
 void my_mutexes_init() {

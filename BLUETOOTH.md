@@ -21,6 +21,8 @@ You can tell the remapper is in pairing mode if the blue LED is lit constantly. 
 
 To make the remapper forget all currently paired devices, hold the "user switch" button for over 3 seconds, or click the "Forget all devices" button on the web configuration tool (or short pin 0 to GND for over 3 seconds on the Seeed Xiao board).
 
+The "Actions" tab of the web configuration tool lists the currently paired devices, shows which of them are connected, and lets you forget a single device. Device names are read from the device after it connects, so a newly paired device can show up as "Unnamed device" for a moment.
+
 ## Known issues
 
 * Quirks mechanism for fixing broken report descriptors doesn't work.

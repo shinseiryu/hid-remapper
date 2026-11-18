@@ -296,6 +296,25 @@
                     </div>
                 </div>
 
+                <div class="row mt-4 d-none" id="paired_devices_container">
+                    <div class="col-8">
+                        <h5>Paired devices</h5>
+                        <p class="text-muted small" id="paired_devices_status"></p>
+                        <ul class="list-group" id="paired_devices_list"></ul>
+                    </div>
+                </div>
+
+                <template id="paired_device_template">
+                    <li class="list-group-item d-flex align-items-center">
+                        <div class="me-auto">
+                            <div class="paired_device_name fw-semibold"></div>
+                            <div class="paired_device_address text-muted small font-monospace"></div>
+                        </div>
+                        <span class="paired_device_connected badge me-3"></span>
+                        <button type="button" class="paired_device_forget btn btn-outline-danger btn-sm">Forget</button>
+                    </li>
+                </template>
+
             </div>
 
             <div class="tab-pane" id="nav-monitor" role="tabpanel" tabindex="0">

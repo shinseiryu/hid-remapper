@@ -9,6 +9,8 @@ void do_persist_config(uint8_t* buffer);
 void reset_to_bootloader();
 void pair_new_device();
 void clear_bonds();
+bool get_paired_device(uint32_t index, paired_device_t* device);
+void forget_device(uint8_t addr_type, const uint8_t* addr);
 void flash_b_side();
 
 void my_mutexes_init();
