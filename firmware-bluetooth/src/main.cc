@@ -224,7 +224,9 @@ static void set_led_mode(LedMode led_mode_) {
 }
 
 static void scan_start() {
-    if (CHK(bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE))) {
+    // Active scanning, so that we also get scan responses. Some devices (for example
+    // some Lenovo keyboards) only put the HID service UUID in the scan response.
+    if (CHK(bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE))) {
         LOG_DBG("Scanning started.");
         scanning = true;
     }
